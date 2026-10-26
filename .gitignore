@@ -1,0 +1,6 @@
+.env
+.venv/
+warns.json
+.venv-1/
+.vscode/
+__pycache__/

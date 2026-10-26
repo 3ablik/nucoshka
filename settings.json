@@ -1,0 +1,11 @@
+{
+  "-1003968434962": {
+    "warn_action": "mute",
+    "warn_mute_min": 5,
+    "warn_limit_mute_min": 360,
+    "warn_expire_min": 20160,
+    "warn_limit": 3,
+    "fw1_action": "warn",
+    "fw1_whole": true
+  }
+}
