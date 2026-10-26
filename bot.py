@@ -17,6 +17,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, ChatMemberUpdated, ChatPermissions, Message, ReplyParameters
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest
+from aiohttp import ClientSession, ClientTimeout, web
 from dotenv import load_dotenv
 
 from aiohttp import web
@@ -1904,8 +1905,52 @@ async def scheduler():
         await asyncio.sleep(20)
 
 
+# ---------- не даём Render усыпить сервис ----------
+
+KEEPALIVE_URL = os.getenv("RENDER_EXTERNAL_URL")  # Render задаёт сам для веб-сервисов
+WEB_PORT = os.getenv("PORT")                      # Render тоже (по умолчанию 10000)
+KEEPALIVE_SECONDS = 300
+
+
+async def start_web_server() -> None:
+    """Мини-сервер: Render ждёт открытый порт, и на нём же отвечаем на пинги."""
+    if not WEB_PORT:
+        return  # локальный запуск: сервер не нужен
+
+    async def ok(request):
+        return web.Response(text="bot is running")
+
+    app = web.Application()
+    app.router.add_get("/", ok)
+    app.router.add_get("/health", ok)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    try:
+        await web.TCPSite(runner, "0.0.0.0", int(WEB_PORT)).start()
+        logging.info("Мини-сервер запущен на порту %s", WEB_PORT)
+    except OSError as e:
+        logging.warning("Порт %s уже занят (%s), мини-сервер не нужен", WEB_PORT, e)
+
+
+async def keepalive() -> None:
+    """Раз в несколько минут обращаемся к собственному публичному адресу."""
+    if not KEEPALIVE_URL:
+        return  # локальный запуск
+    await asyncio.sleep(60)  # даём серверу время запуститься
+    async with ClientSession(timeout=ClientTimeout(total=30)) as session:
+        while True:
+            try:
+                async with session.get(KEEPALIVE_URL) as resp:
+                    logging.info("keepalive: ответ %s", resp.status)
+            except Exception as e:
+                logging.warning("keepalive не удался: %s", e)
+            await asyncio.sleep(KEEPALIVE_SECONDS)
+
+
 async def main():
     asyncio.create_task(scheduler())
+    asyncio.create_task(keepalive())
+    await start_web_server()
     try:
         await dp.start_polling(
             bot,
