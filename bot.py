@@ -14,7 +14,10 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, ChatMemberUpdated, ChatPermissions, Message, ReplyParameters
+from aiogram.types import (
+    BufferedInputFile, CallbackQuery, ChatJoinRequest, ChatMemberUpdated,
+    ChatPermissions, Message, ReplyParameters,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest
 from aiohttp import ClientSession, ClientTimeout, web
@@ -214,6 +217,7 @@ def chat_menu(chat_id: int):
     kb.button(text="⏰ Расписание", callback_data=f"sched:{chat_id}")
     kb.button(text="⚠️ Предупреждения", callback_data=f"warn:{chat_id}")
     kb.button(text="🚫 Запретные слова", callback_data=f"fw:{chat_id}")
+    kb.button(text="📥 Заявки в чат", callback_data=f"jn:{chat_id}")
     kb.button(text="⬅️ К списку групп", callback_data="chats")
     kb.adjust(1)
     return f"Группа: {get_title(chat_id)}\nЧто настроим?", kb.as_markup()
@@ -1860,6 +1864,501 @@ async def cmd_editpin(message: Message, command: CommandObject):
     await try_delete(message)
     if html_failed:
         await notify(chat_id, "ℹ️ HTML не распознан, отправил как обычный текст.", delete_after=15)
+
+
+# ---------- заявки на вступление ----------
+
+MAX_FILE_BYTES = 10 * 1024 * 1024  # больше 10 МБ не принимаем: бесплатная база небольшая
+
+DEFAULT_GREETING = (
+    "Привет, {name}! 👋\n\n"
+    "Я - админ-бот группы «{chat}». Я помогаю управлять группой.\n\n"
+    "Так как ты подал(а) заявку в «{chat}». Чтобы мы быстрее её рассмотрели, "
+    "отправь мне в ответ на это сообщение свой оффер в виде картинки "
+    "png/jpg или файлом pdf."
+    "Это необходимо что бы убедиться что ты дейтсвительно принадлежишь "
+    "этому потоку. Я передам это все живому админу и после проверки "
+    "вы будете принято в чат. Спасибо за понимание!"
+)
+DEFAULT_SETTINGS["join_enabled"] = False
+DEFAULT_SETTINGS["join_greeting"] = DEFAULT_GREETING
+
+STATUS_LABELS = {
+    "pending": "⏳ ждёт решения",
+    "approved": "✅ принята",
+    "declined": "❌ отклонена",
+    "closed": "🔒 закрыта",
+}
+
+
+class EditGreeting(StatesGroup):
+    text = State()
+
+
+# ---------- база данных (в отдельных потоках, чтобы не тормозить бота) ----------
+
+APP_COLUMNS = (
+    "a.id, a.chat_id, a.user_id, a.username, a.full_name, a.status, a.requested_at, "
+    "(SELECT count(*) FROM application_items i WHERE i.application_id = a.id)"
+)
+
+
+def db_init_apps() -> None:
+    with _db_connect() as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS join_applications ("
+            "id BIGSERIAL PRIMARY KEY, chat_id BIGINT NOT NULL, user_id BIGINT NOT NULL, "
+            "username TEXT, full_name TEXT, status TEXT NOT NULL DEFAULT 'pending', "
+            "requested_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE (chat_id, user_id))"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS application_items ("
+            "id BIGSERIAL PRIMARY KEY, "
+            "application_id BIGINT NOT NULL REFERENCES join_applications(id) ON DELETE CASCADE, "
+            "kind TEXT NOT NULL, text TEXT, file_name TEXT, mime_type TEXT, file_data BYTEA, "
+            "created_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+        )
+
+
+def db_save_request(chat_id: int, user_id: int, username, full_name) -> int:
+    with _db_connect() as conn:
+        row = conn.execute(
+            "INSERT INTO join_applications (chat_id, user_id, username, full_name, status, requested_at) "
+            "VALUES (%s, %s, %s, %s, 'pending', now()) "
+            "ON CONFLICT (chat_id, user_id) DO UPDATE SET username = EXCLUDED.username, "
+            "full_name = EXCLUDED.full_name, status = 'pending', requested_at = now() "
+            "RETURNING id",
+            (chat_id, user_id, username, full_name),
+        ).fetchone()
+    return row[0]
+
+
+def db_find_pending(user_id: int):
+    with _db_connect() as conn:
+        row = conn.execute(
+            "SELECT id FROM join_applications WHERE user_id = %s AND status = 'pending' "
+            "ORDER BY requested_at DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+    return row[0] if row else None
+
+
+def db_add_item(app_id: int, kind: str, text, file_name, mime_type, data) -> None:
+    with _db_connect() as conn:
+        conn.execute(
+            "INSERT INTO application_items (application_id, kind, text, file_name, mime_type, file_data) "
+            "VALUES (%s, %s, %s, %s, %s, %s)",
+            (app_id, kind, text, file_name, mime_type, data),
+        )
+
+
+def db_list_apps(chat_id: int, limit: int = 15) -> list:
+    with _db_connect() as conn:
+        return conn.execute(
+            f"SELECT {APP_COLUMNS} FROM join_applications a "
+            "WHERE a.chat_id = %s ORDER BY a.requested_at DESC LIMIT %s",
+            (chat_id, limit),
+        ).fetchall()
+
+
+def db_get_app(app_id: int):
+    with _db_connect() as conn:
+        return conn.execute(
+            f"SELECT {APP_COLUMNS} FROM join_applications a WHERE a.id = %s", (app_id,)
+        ).fetchone()
+
+
+def db_get_items(app_id: int) -> list:
+    with _db_connect() as conn:
+        return conn.execute(
+            "SELECT kind, text, file_name, mime_type, file_data FROM application_items "
+            "WHERE application_id = %s ORDER BY id",
+            (app_id,),
+        ).fetchall()
+
+
+def db_set_status(app_id: int, status: str) -> None:
+    with _db_connect() as conn:
+        conn.execute("UPDATE join_applications SET status = %s WHERE id = %s", (status, app_id))
+
+
+def db_count_pending(chat_id: int) -> int:
+    with _db_connect() as conn:
+        return conn.execute(
+            "SELECT count(*) FROM join_applications WHERE chat_id = %s AND status = 'pending'",
+            (chat_id,),
+        ).fetchone()[0]
+
+
+async def init_applications() -> None:
+    if not DATABASE_URL:
+        logging.warning("DATABASE_URL не задан: приём заявок отключён")
+        return
+    await asyncio.to_thread(db_init_apps)
+
+
+# ---------- заявка: приветствие в личку ----------
+
+def render_greeting(template: str, first_name: str, chat_title: str) -> str:
+    return (
+        template
+        .replace("{name}", html.escape(first_name or ""))
+        .replace("{chat}", html.escape(chat_title or ""))
+    )
+
+
+@dp.chat_join_request()
+async def on_join_request(event: ChatJoinRequest):
+    chat_id = event.chat.id
+    s = get_settings(chat_id)
+    if not s["join_enabled"] or not DATABASE_URL:
+        return
+    remember_chat(event.chat)
+
+    user = event.from_user
+    try:
+        await asyncio.to_thread(db_save_request, chat_id, user.id, user.username, user.full_name)
+    except Exception as e:
+        logging.error("заявка: не удалось сохранить: %s", e)
+        return
+
+    text = render_greeting(s["join_greeting"], user.first_name, event.chat.title)
+    try:
+        # user_chat_id: личный чат с заявителем, писать можно без /start
+        await send_payload(event.user_chat_id, text, None)
+    except Exception as e:
+        logging.error("заявка: не удалось написать заявителю %s: %s", user.id, e)
+
+
+# ---------- панель: заявки ----------
+
+def ids_from(call: CallbackQuery) -> list:
+    return [int(x) for x in call.data.split(":")[1:]]
+
+
+async def join_menu_view(chat_id: int):
+    s = get_settings(chat_id)
+    status = "включён ✅" if s["join_enabled"] else "выключен ⛔"
+    pending = "—"
+    if DATABASE_URL:
+        try:
+            pending = str(await asyncio.to_thread(db_count_pending, chat_id))
+        except Exception as e:
+            logging.error("заявки: %s", e)
+            pending = "?"
+    text = (
+        f"📥 Заявки в чат. Группа: {get_title(chat_id)}\n\n"
+        f"• Приём заявок: {status}\n"
+        f"• Ждут решения: {pending}\n\n"
+        "Бот пишет каждому, кто подал заявку, и сохраняет его ответы "
+        "(фото, PDF, текст). В приветствии можно использовать {name} (имя заявителя) "
+        "и {chat} (название группы)."
+    )
+    if not DATABASE_URL:
+        text += "\n\n⚠️ База данных не подключена, приём заявок не работает."
+
+    kb = InlineKeyboardBuilder()
+    kb.button(
+        text="🔕 Выключить приём" if s["join_enabled"] else "🔔 Включить приём",
+        callback_data=f"jt:{chat_id}",
+    )
+    kb.button(text="✏️ Изменить приветствие", callback_data=f"jg:{chat_id}")
+    kb.button(text="👁 Показать приветствие", callback_data=f"jv:{chat_id}")
+    kb.button(text="📋 Заявки", callback_data=f"jl:{chat_id}")
+    kb.button(text="⬅️ Назад", callback_data=f"chat:{chat_id}")
+    kb.adjust(1)
+    return text, kb.as_markup()
+
+
+async def apps_list_view(chat_id: int):
+    rows = await asyncio.to_thread(db_list_apps, chat_id, 15)
+    kb = InlineKeyboardBuilder()
+    for app_id, _, user_id, username, full_name, status, _, items in rows:
+        icon = STATUS_LABELS.get(status, "❔").split()[0]
+        label = f"{icon} {full_name or user_id}"
+        if username:
+            label += f" (@{username})"
+        label += f" · 📎{items}"
+        kb.button(text=label[:60], callback_data=f"jo:{chat_id}:{app_id}")
+    kb.button(text="⬅️ Назад", callback_data=f"jn:{chat_id}")
+    kb.adjust(1)
+    text = "📋 Последние заявки (до 15):" if rows else "Заявок пока нет."
+    return text, kb.as_markup()
+
+
+async def app_view(chat_id: int, app_id: int):
+    row = await asyncio.to_thread(db_get_app, app_id)
+    if not row or row[1] != chat_id:
+        return "Заявка не найдена.", back_button(f"jl:{chat_id}")
+    _, _, user_id, username, full_name, status, requested_at, items = row
+    when = requested_at.astimezone(TZ).strftime("%d.%m.%Y %H:%M")
+    who = full_name or "—"
+    if username:
+        who += f" (@{username})"
+    text = (
+        f"Заявка №{app_id}\n\n"
+        f"👤 {who}\nID: {user_id}\n"
+        f"Статус: {STATUS_LABELS.get(status, status)}\n"
+        f"Подана: {when}\n"
+        f"Материалов: {items}"
+    )
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📎 Показать материалы", callback_data=f"jm:{chat_id}:{app_id}")
+    kb.button(text="✅ Принять", callback_data=f"jy:{chat_id}:{app_id}")
+    kb.button(text="❌ Отклонить", callback_data=f"jx:{chat_id}:{app_id}")
+    kb.button(text="⬅️ Назад", callback_data=f"jl:{chat_id}")
+    kb.adjust(1, 2, 1)
+    return text, kb.as_markup()
+
+
+@dp.callback_query(F.data.startswith("jn:"))
+async def cb_jn(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    (chat_id,) = ids_from(call)
+    if not await check_callback_admin(call, chat_id):
+        return
+    text, markup = await join_menu_view(chat_id)
+    await safe_edit(call, text, markup)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("jt:"))
+async def cb_jt(call: CallbackQuery):
+    (chat_id,) = ids_from(call)
+    if not await check_callback_admin(call, chat_id):
+        return
+    set_setting(chat_id, "join_enabled", not get_settings(chat_id)["join_enabled"])
+    text, markup = await join_menu_view(chat_id)
+    await safe_edit(call, text, markup)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("jv:"))
+async def cb_jv(call: CallbackQuery):
+    (chat_id,) = ids_from(call)
+    if not await check_callback_admin(call, chat_id):
+        return
+    text = render_greeting(
+        get_settings(chat_id)["join_greeting"], call.from_user.first_name, get_title(chat_id)
+    )
+    await send_payload(call.message.chat.id, text, None)
+    await call.answer("Так приветствие увидит заявитель")
+
+
+@dp.callback_query(F.data.startswith("jg:"))
+async def cb_jg(call: CallbackQuery, state: FSMContext):
+    (chat_id,) = ids_from(call)
+    if not await check_callback_admin(call, chat_id):
+        return
+    await state.set_state(EditGreeting.text)
+    await state.update_data(chat_id=chat_id)
+    await safe_edit(
+        call,
+        "Пришли новый текст приветствия. Оформление Telegram сохранится, "
+        "либо можно писать HTML-теги.\n"
+        "{name} заменится на имя заявителя, {chat} на название группы.\n\n"
+        "Отмена: кнопка «Назад» или /cancel",
+        back_button(f"jn:{chat_id}"),
+    )
+    await call.answer()
+
+
+@dp.message(EditGreeting.text, F.text, F.chat.type == "private")
+async def got_greeting(message: Message, state: FSMContext):
+    chat_id = (await state.get_data())["chat_id"]
+    if not await user_is_admin(chat_id, message.from_user.id):
+        await state.clear()
+        await message.answer("Нет прав в этой группе.")
+        return
+
+    has_format = any(e.type in FORMAT_TYPES for e in (message.entities or []))
+    greeting = message.html_text if has_format else message.text
+    if len(greeting) > 3000:
+        await message.answer("Слишком длинно, сократи до 3000 символов.")
+        return
+
+    preview = render_greeting(greeting, message.from_user.first_name, get_title(chat_id))
+    try:
+        _, html_failed = await send_payload(message.chat.id, preview, None)
+    except Exception as e:
+        logging.error("приветствие: %s", e)
+        await message.answer("Не получилось отправить такой текст, возможно, он слишком длинный.")
+        return
+    if html_failed:
+        await message.answer("HTML распознать не удалось. Проверь теги и пришли текст ещё раз.")
+        return
+
+    set_setting(chat_id, "join_greeting", greeting)
+    await state.clear()
+    await message.answer(
+        "✅ Сохранено. Выше показано, как приветствие увидит заявитель.",
+        reply_markup=back_button(f"jn:{chat_id}"),
+    )
+
+
+@dp.callback_query(F.data.startswith("jl:"))
+async def cb_jl(call: CallbackQuery):
+    (chat_id,) = ids_from(call)
+    if not await check_callback_admin(call, chat_id):
+        return
+    if not DATABASE_URL:
+        await call.answer("База данных не подключена", show_alert=True)
+        return
+    text, markup = await apps_list_view(chat_id)
+    await safe_edit(call, text, markup)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("jo:"))
+async def cb_jo(call: CallbackQuery):
+    chat_id, app_id = ids_from(call)
+    if not await check_callback_admin(call, chat_id):
+        return
+    text, markup = await app_view(chat_id, app_id)
+    await safe_edit(call, text, markup)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("jm:"))
+async def cb_jm(call: CallbackQuery):
+    chat_id, app_id = ids_from(call)
+    if not await check_callback_admin(call, chat_id):
+        return
+    row = await asyncio.to_thread(db_get_app, app_id)
+    if not row or row[1] != chat_id:
+        await call.answer("Заявка не найдена", show_alert=True)
+        return
+    items = await asyncio.to_thread(db_get_items, app_id)
+    if not items:
+        await call.answer("Заявитель пока ничего не прислал", show_alert=True)
+        return
+
+    await call.answer()
+    await call.message.answer(f"📎 Материалы заявки №{app_id}: {row[4] or row[2]}")
+    for kind, text, file_name, mime, data in items[:30]:
+        try:
+            if kind == "text":
+                await call.message.answer(f"💬 {(text or '')[:4000]}")
+            else:
+                file = BufferedInputFile(bytes(data), filename=file_name or "file")
+                caption = text[:1000] if text else None
+                if kind == "photo":
+                    await call.message.answer_photo(file, caption=caption)
+                else:
+                    await call.message.answer_document(file, caption=caption)
+        except Exception as e:
+            logging.error("заявка: не удалось показать материал: %s", e)
+            await call.message.answer("(не удалось показать один из материалов)")
+    if len(items) > 30:
+        await call.message.answer(f"Показаны первые 30 из {len(items)}.")
+
+
+async def decide_application(call: CallbackQuery, approve: bool):
+    chat_id, app_id = ids_from(call)
+    if not await check_callback_admin(call, chat_id):
+        return
+    row = await asyncio.to_thread(db_get_app, app_id)
+    if not row or row[1] != chat_id:
+        await call.answer("Заявка не найдена", show_alert=True)
+        return
+
+    user_id = row[2]
+    new_status = "approved" if approve else "declined"
+    try:
+        if approve:
+            await bot.approve_chat_join_request(chat_id, user_id)
+        else:
+            await bot.decline_chat_join_request(chat_id, user_id)
+    except TelegramBadRequest as e:
+        err = str(e)
+        if "USER_ALREADY_PARTICIPANT" in err:
+            new_status = "approved"  # уже в группе, например принят вручную
+        elif "HIDE_REQUESTER_MISSING" in err:
+            new_status = "closed"    # заявка уже обработана или отозвана
+        else:
+            logging.error("заявка: %s", e)
+            await call.answer(
+                "Не получилось. Проверь, что у меня есть право приглашать пользователей.",
+                show_alert=True,
+            )
+            return
+
+    await asyncio.to_thread(db_set_status, app_id, new_status)
+    text, markup = await app_view(chat_id, app_id)
+    await safe_edit(call, text, markup)
+    await call.answer(
+        {"approved": "Принята ✅", "declined": "Отклонена ❌", "closed": "Заявка уже закрыта"}[new_status]
+    )
+
+
+@dp.callback_query(F.data.startswith("jy:"))
+async def cb_jy(call: CallbackQuery):
+    await decide_application(call, approve=True)
+
+
+@dp.callback_query(F.data.startswith("jx:"))
+async def cb_jx(call: CallbackQuery):
+    await decide_application(call, approve=False)
+
+
+# ---------- ответы заявителей в личке (держать в конце, после всех личных обработчиков) ----------
+
+@dp.message(F.chat.type == "private", F.photo | F.document | F.text)
+async def applicant_message(message: Message):
+    user = message.from_user
+    if not DATABASE_URL or not user:
+        return
+    if message.text and message.text.startswith("/"):
+        return
+    app_id = await asyncio.to_thread(db_find_pending, user.id)
+    if not app_id:
+        return  # это не заявитель
+
+    file_obj = file_name = mime = None
+    if message.photo:
+        file_obj = message.photo[-1]  # самый большой размер
+        kind = "photo"
+        file_name = f"photo_{file_obj.file_unique_id}.jpg"
+        mime = "image/jpeg"
+    elif message.document:
+        doc = message.document
+        mime = doc.mime_type or ""
+        if not (mime == "application/pdf" or mime.startswith("image/")):
+            await message.answer(
+                "Файлы такого типа я не принимаю. Пришли фото или PDF, "
+                "а текстом можно написать что угодно."
+            )
+            return
+        kind = "document"
+        file_obj = doc
+        file_name = doc.file_name or f"file_{doc.file_unique_id}"
+    else:
+        kind = "text"
+
+    too_big = f"Файл слишком большой, максимум {MAX_FILE_BYTES // (1024 * 1024)} МБ."
+    data = None
+    if file_obj:
+        if file_obj.file_size and file_obj.file_size > MAX_FILE_BYTES:
+            await message.answer(too_big)
+            return
+        try:
+            data = (await bot.download(file_obj)).getvalue()
+        except Exception as e:
+            logging.error("заявка: не удалось скачать файл: %s", e)
+            await message.answer("Не получилось получить файл, попробуй отправить ещё раз.")
+            return
+        if len(data) > MAX_FILE_BYTES:
+            await message.answer(too_big)
+            return
+
+    text = message.text if kind == "text" else message.caption
+    try:
+        await asyncio.to_thread(db_add_item, app_id, kind, text, file_name, mime, data)
+    except Exception as e:
+        logging.error("заявка: не удалось сохранить материал: %s", e)
+        await message.answer("Не получилось сохранить, попробуй ещё раз чуть позже.")
+        return
+    await message.answer("✅ Получил, передал администраторам.")
 
 
 # ---------- группы: запоминаем, где есть бот ----------
