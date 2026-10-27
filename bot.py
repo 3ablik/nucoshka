@@ -1868,7 +1868,7 @@ async def cmd_editpin(message: Message, command: CommandObject):
 
 # ---------- заявки на вступление ----------
 
-MAX_FILE_BYTES = 10 * 1024 * 1024  # больше 10 МБ не принимаем: бесплатная база небольшая
+MAX_FILE_BYTES = 4 * 1024 * 1024  # больше 4 МБ не принимаем: бесплатная база небольшая
 
 DEFAULT_GREETING = (
     "Привет, {name}! 👋\n\n"
@@ -1952,13 +1952,23 @@ def db_add_item(app_id: int, kind: str, text, file_name, mime_type, data) -> Non
         )
 
 
-def db_list_apps(chat_id: int, limit: int = 15) -> list:
+PAGE_SIZE = 10
+
+
+def db_list_apps(chat_id: int, limit: int = PAGE_SIZE, offset: int = 0) -> list:
     with _db_connect() as conn:
         return conn.execute(
             f"SELECT {APP_COLUMNS} FROM join_applications a "
-            "WHERE a.chat_id = %s ORDER BY a.requested_at DESC LIMIT %s",
-            (chat_id, limit),
+            "WHERE a.chat_id = %s ORDER BY a.requested_at ASC LIMIT %s OFFSET %s",
+            (chat_id, limit, offset),
         ).fetchall()
+
+
+def db_count_apps(chat_id: int) -> int:
+    with _db_connect() as conn:
+        return conn.execute(
+            "SELECT count(*) FROM join_applications WHERE chat_id = %s", (chat_id,)
+        ).fetchone()[0]
 
 
 def db_get_app(app_id: int):
@@ -2070,8 +2080,12 @@ async def join_menu_view(chat_id: int):
     return text, kb.as_markup()
 
 
-async def apps_list_view(chat_id: int):
-    rows = await asyncio.to_thread(db_list_apps, chat_id, 15)
+async def apps_list_view(chat_id: int, page: int = 0):
+    total = await asyncio.to_thread(db_count_apps, chat_id)
+    pages = max(1, -(-total // PAGE_SIZE))
+    page = max(0, min(page, pages - 1))
+    rows = await asyncio.to_thread(db_list_apps, chat_id, PAGE_SIZE, page * PAGE_SIZE)
+
     kb = InlineKeyboardBuilder()
     for app_id, _, user_id, username, full_name, status, _, items in rows:
         icon = STATUS_LABELS.get(status, "❔").split()[0]
@@ -2079,17 +2093,31 @@ async def apps_list_view(chat_id: int):
         if username:
             label += f" (@{username})"
         label += f" · 📎{items}"
-        kb.button(text=label[:60], callback_data=f"jo:{chat_id}:{app_id}")
+        kb.button(text=label[:60], callback_data=f"jo:{chat_id}:{app_id}:{page}")
+
+    nav = 0
+    if page > 0:
+        kb.button(text="⬅️", callback_data=f"jl:{chat_id}:{page - 1}")
+        nav += 1
+    kb.button(text=f"{page + 1}/{pages}", callback_data="noop")
+    nav += 1
+    if page < pages - 1:
+        kb.button(text="➡️", callback_data=f"jl:{chat_id}:{page + 1}")
+        nav += 1
     kb.button(text="⬅️ Назад", callback_data=f"jn:{chat_id}")
-    kb.adjust(1)
-    text = "📋 Последние заявки (до 15):" if rows else "Заявок пока нет."
+    kb.adjust(*([1] * len(rows)), nav, 1)
+
+    if total:
+        text = f"📋 Заявок: {total}. Сначала самые старые.\nСтраница {page + 1} из {pages}."
+    else:
+        text = "Заявок пока нет."
     return text, kb.as_markup()
 
 
-async def app_view(chat_id: int, app_id: int):
+async def app_view(chat_id: int, app_id: int, page: int = 0):
     row = await asyncio.to_thread(db_get_app, app_id)
     if not row or row[1] != chat_id:
-        return "Заявка не найдена.", back_button(f"jl:{chat_id}")
+        return "Заявка не найдена.", back_button(f"jl:{chat_id}:{page}")
     _, _, user_id, username, full_name, status, requested_at, items = row
     when = requested_at.astimezone(TZ).strftime("%d.%m.%Y %H:%M")
     who = full_name or "—"
@@ -2106,7 +2134,7 @@ async def app_view(chat_id: int, app_id: int):
     kb.button(text="📎 Показать материалы", callback_data=f"jm:{chat_id}:{app_id}")
     kb.button(text="✅ Принять", callback_data=f"jy:{chat_id}:{app_id}")
     kb.button(text="❌ Отклонить", callback_data=f"jx:{chat_id}:{app_id}")
-    kb.button(text="⬅️ Назад", callback_data=f"jl:{chat_id}")
+    kb.button(text="⬅️ Назад", callback_data=f"jl:{chat_id}:{page}")
     kb.adjust(1, 2, 1)
     return text, kb.as_markup()
 
@@ -2198,23 +2226,25 @@ async def got_greeting(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("jl:"))
 async def cb_jl(call: CallbackQuery):
-    (chat_id,) = ids_from(call)
+    chat_id, *rest = ids_from(call)
+    page = rest[0] if rest else 0
     if not await check_callback_admin(call, chat_id):
         return
     if not DATABASE_URL:
         await call.answer("База данных не подключена", show_alert=True)
         return
-    text, markup = await apps_list_view(chat_id)
+    text, markup = await apps_list_view(chat_id, page)
     await safe_edit(call, text, markup)
     await call.answer()
 
 
 @dp.callback_query(F.data.startswith("jo:"))
 async def cb_jo(call: CallbackQuery):
-    chat_id, app_id = ids_from(call)
+    chat_id, app_id, *rest = ids_from(call)
+    page = rest[0] if rest else 0
     if not await check_callback_admin(call, chat_id):
         return
-    text, markup = await app_view(chat_id, app_id)
+    text, markup = await app_view(chat_id, app_id, page)
     await safe_edit(call, text, markup)
     await call.answer()
 
