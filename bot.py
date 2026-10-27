@@ -2221,7 +2221,7 @@ async def cb_jo(call: CallbackQuery):
 
 # ---------- показанные материалы: автоудаление ----------
 
-MATERIALS_TTL = 600  # через сколько секунд убирать материалы из чата админа
+MATERIALS_TTL = 10  # через сколько секунд убирать материалы из чата админа
 # (id заявки, чат админа) -> {"gen": метка показа, "msgs": [(chat_id, message_id), ...]}
 shown_materials: dict = {}
 
@@ -2297,7 +2297,7 @@ async def cb_jm(call: CallbackQuery):
 
     await keep(call.message.answer(
         f"📎 Материалы заявки №{app_id}: {row[4] or row[2]}\n"
-        f"Они исчезнут из чата через {MATERIALS_TTL // 60} мин, после решения по заявке "
+        f"Они исчезнут из чата через {MATERIALS_TTL} сек, после решения по заявке "
         "или по кнопке ниже.",
         reply_markup=hide_button(chat_id, app_id),
     ))
