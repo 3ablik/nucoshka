@@ -2446,14 +2446,25 @@ async def keepalive() -> None:
             await asyncio.sleep(KEEPALIVE_SECONDS)
 
 
+# страховка: таблицы заявок создаются при запуске независимо от main()
+if DATABASE_URL:
+    try:
+        db_init_apps()
+    except Exception as e:
+        logging.error("не удалось создать таблицы заявок: %s", e)
+
 async def main():
+    await init_applications()
     asyncio.create_task(scheduler())
     asyncio.create_task(keepalive())
     await start_web_server()
     try:
         await dp.start_polling(
             bot,
-            allowed_updates=["message", "edited_message", "callback_query", "my_chat_member"],
+            allowed_updates=[
+                "message", "edited_message", "callback_query",
+                "my_chat_member", "chat_join_request",
+            ],
         )
     finally:
         flush_storage()
