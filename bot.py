@@ -2335,7 +2335,7 @@ async def decide_application(call: CallbackQuery, approve: bool):
         return
 
     user_id = row[2]
-    new_status = "approved" if approve else "declined"
+    result = "approved" if approve else "declined"
     try:
         if approve:
             await bot.approve_chat_join_request(chat_id, user_id)
@@ -2344,9 +2344,9 @@ async def decide_application(call: CallbackQuery, approve: bool):
     except TelegramBadRequest as e:
         err = str(e)
         if "USER_ALREADY_PARTICIPANT" in err:
-            new_status = "approved"  # уже в группе, например принят вручную
+            result = "approved"  # уже в группе, например принят вручную
         elif "HIDE_REQUESTER_MISSING" in err:
-            new_status = "closed"    # заявка уже обработана или отозвана
+            result = "closed"    # заявка уже обработана или отозвана
         else:
             logging.error("заявка: %s", e)
             await call.answer(
@@ -2355,12 +2355,22 @@ async def decide_application(call: CallbackQuery, approve: bool):
             )
             return
 
-    await asyncio.to_thread(db_set_status, app_id, new_status)
-    text, markup = await app_view(chat_id, app_id)
-    await safe_edit(call, text, markup)
-    await call.answer(
-        {"approved": "Принята ✅", "declined": "Отклонена ❌", "closed": "Заявка уже закрыта"}[new_status]
-    )
+    # решение принято: удаляем данные заявки и показанные материалы
+    await clear_materials(app_id)
+    try:
+        await asyncio.to_thread(db_delete_app, app_id)
+        note = f"Данные заявки №{app_id} (профиль, файлы, сообщения) удалены из базы."
+    except Exception as e:
+        logging.error("заявка: не удалось удалить данные: %s", e)
+        note = "⚠️ Решение принято, но данные удалить не получилось. Попробуй позже."
+
+    titles = {
+        "approved": "✅ Заявка принята.",
+        "declined": "❌ Заявка отклонена.",
+        "closed": "🔒 Заявка уже была обработана или отозвана.",
+    }
+    await safe_edit(call, f"{titles[result]}\n{note}", back_button(f"jl:{chat_id}"))
+    await call.answer(titles[result])
 
 
 @dp.callback_query(F.data.startswith("jy:"))
