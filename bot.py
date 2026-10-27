@@ -2219,6 +2219,57 @@ async def cb_jo(call: CallbackQuery):
     await call.answer()
 
 
+# ---------- показанные материалы: автоудаление ----------
+
+MATERIALS_TTL = 600  # через сколько секунд убирать материалы из чата админа
+# (id заявки, чат админа) -> {"gen": метка показа, "msgs": [(chat_id, message_id), ...]}
+shown_materials: dict = {}
+
+
+def db_delete_app(app_id: int) -> None:
+    """Удаляет заявку; связанные материалы удаляются каскадом."""
+    with _db_connect() as conn:
+        conn.execute("DELETE FROM join_applications WHERE id = %s", (app_id,))
+
+
+async def clear_materials(app_id: int, admin_chat: int | None = None) -> None:
+    """Удаляет из чатов админов показанные материалы заявки."""
+    keys = [k for k in shown_materials if k[0] == app_id and (admin_chat is None or k[1] == admin_chat)]
+    for key in keys:
+        entry = shown_materials.pop(key)
+        for chat_id, message_id in entry["msgs"]:
+            try:
+                await bot.delete_message(chat_id, message_id)
+            except Exception:
+                pass
+
+
+async def clear_materials_later(app_id: int, admin_chat: int, gen: int) -> None:
+    await asyncio.sleep(MATERIALS_TTL)
+    entry = shown_materials.get((app_id, admin_chat))
+    if entry and entry["gen"] == gen:  # не трогаем более свежий показ
+        await clear_materials(app_id, admin_chat)
+
+
+def hide_button(chat_id: int, app_id: int):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🗑 Скрыть материалы", callback_data=f"jh:{chat_id}:{app_id}")
+    return kb.as_markup()
+
+
+@dp.callback_query(F.data.startswith("jh:"))
+async def cb_jh(call: CallbackQuery):
+    chat_id, app_id = ids_from(call)
+    if not await check_callback_admin(call, chat_id):
+        return
+    await call.answer("Скрыто")
+    await clear_materials(app_id, call.message.chat.id)
+    try:
+        await call.message.delete()  # на случай, если бот перезапускался и забыл про сообщения
+    except Exception:
+        pass
+
+
 @dp.callback_query(F.data.startswith("jm:"))
 async def cb_jm(call: CallbackQuery):
     chat_id, app_id = ids_from(call)
@@ -2234,24 +2285,45 @@ async def cb_jm(call: CallbackQuery):
         return
 
     await call.answer()
-    await call.message.answer(f"📎 Материалы заявки №{app_id}: {row[4] or row[2]}")
+    admin_chat = call.message.chat.id
+    await clear_materials(app_id, admin_chat)  # прошлый показ этой заявки убираем
+
+    sent = []
+
+    async def keep(coro):
+        msg = await coro
+        sent.append((msg.chat.id, msg.message_id))
+        return msg
+
+    await keep(call.message.answer(
+        f"📎 Материалы заявки №{app_id}: {row[4] or row[2]}\n"
+        f"Они исчезнут из чата через {MATERIALS_TTL // 60} мин, после решения по заявке "
+        "или по кнопке ниже.",
+        reply_markup=hide_button(chat_id, app_id),
+    ))
+
     for kind, text, file_name, mime, data in items[:30]:
         try:
             if kind == "text":
-                await call.message.answer(f"💬 {(text or '')[:4000]}")
+                await keep(call.message.answer(f"💬 {(text or '')[:4000]}"))
             else:
                 file = BufferedInputFile(bytes(data), filename=file_name or "file")
                 caption = text[:1000] if text else None
                 if kind == "photo":
-                    await call.message.answer_photo(file, caption=caption)
+                    await keep(call.message.answer_photo(file, caption=caption))
                 else:
-                    await call.message.answer_document(file, caption=caption)
+                    await keep(call.message.answer_document(file, caption=caption))
         except Exception as e:
             logging.error("заявка: не удалось показать материал: %s", e)
-            await call.message.answer("(не удалось показать один из материалов)")
+            await keep(call.message.answer("(не удалось показать один из материалов)"))
     if len(items) > 30:
-        await call.message.answer(f"Показаны первые 30 из {len(items)}.")
+        await keep(call.message.answer(f"Показаны первые 30 из {len(items)}."))
 
+    gen = time.time_ns()
+    shown_materials[(app_id, admin_chat)] = {"gen": gen, "msgs": sent}
+    task = asyncio.create_task(clear_materials_later(app_id, admin_chat, gen))
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
 
 async def decide_application(call: CallbackQuery, approve: bool):
     chat_id, app_id = ids_from(call)
