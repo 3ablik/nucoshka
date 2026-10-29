@@ -739,7 +739,7 @@ async def cmd_kick(message: Message, command: CommandObject):
     try:
         # кик = бан и сразу разбан, человек вылетает, но может вернуться по ссылке
         await bot.ban_chat_member(message.chat.id, target.id)
-        await bot.unban_chat_member(message.chat.id, target.id, only_if_banned=True)
+        await bot.unban_chat_member(message.chat.id, target.id)
     except Exception as e:
         logging.error("kick: %s", e)
         await fail(message)
@@ -948,7 +948,7 @@ async def cmd_warn(message: Message, command: CommandObject):
         try:
             if action == "kick":
                 await bot.ban_chat_member(chat_id, target.id)
-                await bot.unban_chat_member(chat_id, target.id, only_if_banned=True)
+                await bot.unban_chat_member(chat_id, target.id)
             elif action == "ban":
                 await bot.ban_chat_member(chat_id, target.id)
             else:
@@ -1321,7 +1321,7 @@ async def apply_warn(chat_id: int, user_id: int, mention: str, reason: str) -> s
         try:
             if action == "kick":
                 await bot.ban_chat_member(chat_id, user_id)
-                await bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
+                await bot.unban_chat_member(chat_id, user_id)
             elif action == "ban":
                 await bot.ban_chat_member(chat_id, user_id)
             else:
