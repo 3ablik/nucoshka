@@ -2635,9 +2635,19 @@ async def on_bot_status(event: ChatMemberUpdated):
 
 
 @dp.message(F.chat.type.in_(GROUP_TYPES))
+async def is_panel_command(text: str) -> bool:
+    """True для /panel и /panel@имя_этого_бота, но не для /panel@чужой_бот и не для /panelx."""
+    first = text.split(maxsplit=1)[0].lower()
+    command, _, mention = first.partition("@")
+    if command != "/panel":
+        return False
+    return not mention or mention == (await bot.me()).username.lower()
+
+
+@dp.message(F.chat.type.in_(GROUP_TYPES))
 async def group_seen(message: Message):
-    remember_chat(message.chat)
-    if message.text and message.text.startswith("/panel"):
+    remember_chat(message.chat)  # группу запоминаем всегда, но молча
+    if message.text and await is_panel_command(message.text) and await is_group_admin(message):
         await message.reply("Управление настройками теперь в личке со мной 🙂")
 
 
