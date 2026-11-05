@@ -336,6 +336,7 @@ HELP_SECTIONS = {
 • Приём заявок включается кнопкой (по умолчанию выключен). Нужно, чтобы бот был админом с правом приглашать пользователей, а вступление шло по ссылке с одобрением админов.
 • Каждому, кто подал заявку, бот пишет в личку приветствие. Его можно менять: {name} заменится на имя человека, {chat} на название группы.
 • Ответы заявителя (фото, PDF до 10 МБ, текст) сохраняются в базе.
+• Если заявитель ничего не прислал, через заданное время бот один раз напомнит ему (по умолчанию выключено, максимум 23 часа). Время и текст напоминания меняются в том же разделе.
 • 📋 Заявки: очередь по 10 на странице, сначала старые. В заявке можно посмотреть материалы, принять или отклонить.
 • После решения данные заявки удаляются из базы. Показанные материалы сами исчезают из чата через 10 минут, после решения или по кнопке «Скрыть».
 """.strip()),
@@ -2068,17 +2069,24 @@ def db_init_apps() -> None:
             "kind TEXT NOT NULL, text TEXT, file_name TEXT, mime_type TEXT, file_data BYTEA, "
             "created_at TIMESTAMPTZ NOT NULL DEFAULT now())"
         )
+        # поля для напоминаний (добавляются в уже существующую таблицу)
+        conn.execute("ALTER TABLE join_applications ADD COLUMN IF NOT EXISTS remind_at TIMESTAMPTZ")
+        conn.execute(
+            "ALTER TABLE join_applications ADD COLUMN IF NOT EXISTS reminded BOOLEAN NOT NULL DEFAULT FALSE"
+        )
 
 
-def db_save_request(chat_id: int, user_id: int, username, full_name) -> int:
+def db_save_request(chat_id: int, user_id: int, username, full_name, remind_at=None) -> int:
     with _db_connect() as conn:
         row = conn.execute(
-            "INSERT INTO join_applications (chat_id, user_id, username, full_name, status, requested_at) "
-            "VALUES (%s, %s, %s, %s, 'pending', now()) "
+            "INSERT INTO join_applications "
+            "(chat_id, user_id, username, full_name, status, requested_at, remind_at, reminded) "
+            "VALUES (%s, %s, %s, %s, 'pending', now(), %s, FALSE) "
             "ON CONFLICT (chat_id, user_id) DO UPDATE SET username = EXCLUDED.username, "
-            "full_name = EXCLUDED.full_name, status = 'pending', requested_at = now() "
+            "full_name = EXCLUDED.full_name, status = 'pending', requested_at = now(), "
+            "remind_at = EXCLUDED.remind_at, reminded = FALSE "
             "RETURNING id",
-            (chat_id, user_id, username, full_name),
+            (chat_id, user_id, username, full_name, remind_at),
         ).fetchone()
     return row[0]
 
@@ -2150,11 +2158,77 @@ def db_count_pending(chat_id: int) -> int:
         ).fetchone()[0]
 
 
+# ---------- напоминания заявителям ----------
+
+DEFAULT_REMINDER = (
+    "{name}, напоминаю про заявку в «{chat}» 🙂\n\n"
+    "Чтобы мы смогли её рассмотреть, ответь на моё сообщение: "
+    "напиши пару слов о себе и приложи фото или PDF."
+)
+DEFAULT_SETTINGS["join_remind_min"] = 0  # через сколько минут напомнить, 0 = выключено
+DEFAULT_SETTINGS["join_reminder"] = DEFAULT_REMINDER
+REMIND_PRESETS = [0, 30, 60, 180, 360, 720, 1380]  # минуты, максимум 23 часа
+REMINDER_CHECK_SECONDS = 300
+
+
+class EditReminder(StatesGroup):
+    text = State()
+
+
+def db_due_reminders() -> list:
+    """Заявки, которым пора напомнить: (id, chat_id, user_id, имя, сколько материалов прислал)."""
+    with _db_connect() as conn:
+        return conn.execute(
+            "SELECT a.id, a.chat_id, a.user_id, a.full_name, "
+            "(SELECT count(*) FROM application_items i WHERE i.application_id = a.id) "
+            "FROM join_applications a "
+            "WHERE a.status = 'pending' AND NOT a.reminded "
+            "AND a.remind_at IS NOT NULL AND a.remind_at <= now()"
+        ).fetchall()
+
+
+def db_mark_reminded(app_id: int) -> None:
+    with _db_connect() as conn:
+        conn.execute("UPDATE join_applications SET reminded = TRUE WHERE id = %s", (app_id,))
+
+
+async def still_waiting(chat_id: int, user_id: int) -> bool:
+    """False, если человек уже в группе (например, его приняли вручную)."""
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        return member.status not in ("member", "administrator", "creator", "restricted")
+    except Exception:
+        return True
+
+
+async def reminder_loop() -> None:
+    await asyncio.sleep(30)
+    while True:
+        try:
+            for app_id, chat_id, user_id, full_name, items in await asyncio.to_thread(db_due_reminders):
+                s = get_settings(chat_id)
+                if items == 0 and s["join_enabled"] and await still_waiting(chat_id, user_id):
+                    first = full_name.split(maxsplit=1)[0] if full_name else ""
+                    text = render_greeting(s["join_reminder"], first, get_title(chat_id))
+                    try:
+                        await send_payload(user_id, text, None)
+                        logging.info("заявка: напоминание отправлено %s", user_id)
+                    except Exception as e:
+                        logging.warning("заявка: не удалось отправить напоминание %s: %s", user_id, e)
+                await asyncio.to_thread(db_mark_reminded, app_id)  # напоминаем один раз
+        except Exception as e:
+            logging.error("напоминания: %s", e)
+        await asyncio.sleep(REMINDER_CHECK_SECONDS)
+
+
 async def init_applications() -> None:
     if not DATABASE_URL:
         logging.warning("DATABASE_URL не задан: приём заявок отключён")
         return
     await asyncio.to_thread(db_init_apps)
+    task = asyncio.create_task(reminder_loop())
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
 
 
 # ---------- заявка: приветствие в личку ----------
@@ -2176,8 +2250,13 @@ async def on_join_request(event: ChatJoinRequest):
     remember_chat(event.chat)
 
     user = event.from_user
+    remind_at = None
+    if s["join_remind_min"] > 0:
+        remind_at = datetime.now(TZ) + timedelta(minutes=s["join_remind_min"])
     try:
-        await asyncio.to_thread(db_save_request, chat_id, user.id, user.username, user.full_name)
+        await asyncio.to_thread(
+            db_save_request, chat_id, user.id, user.username, user.full_name, remind_at
+        )
     except Exception as e:
         logging.error("заявка: не удалось сохранить: %s", e)
         return
@@ -2199,6 +2278,12 @@ def ids_from(call: CallbackQuery) -> list:
 async def join_menu_view(chat_id: int):
     s = get_settings(chat_id)
     status = "включён ✅" if s["join_enabled"] else "выключен ⛔"
+    minutes = s["join_remind_min"]
+    remind = (
+        "выключено" if minutes == 0
+        else f"через {fmt_minutes(minutes)}, если заявитель ничего не прислал"
+    )
+    remind_btn = "выкл" if minutes == 0 else f"через {fmt_minutes(minutes)}"
     pending = "—"
     if DATABASE_URL:
         try:
@@ -2209,10 +2294,11 @@ async def join_menu_view(chat_id: int):
     text = (
         f"📥 Заявки в чат. Группа: {get_title(chat_id)}\n\n"
         f"• Приём заявок: {status}\n"
+        f"• Напоминание заявителю: {remind}\n"
         f"• Ждут решения: {pending}\n\n"
         "Бот пишет каждому, кто подал заявку, и сохраняет его ответы "
-        "(фото, PDF, текст). В приветствии можно использовать {name} (имя заявителя) "
-        "и {chat} (название группы)."
+        "(фото, PDF, текст). В приветствии и напоминании можно использовать {name} "
+        "(имя заявителя) и {chat} (название группы)."
     )
     if not DATABASE_URL:
         text += "\n\n⚠️ База данных не подключена, приём заявок не работает."
@@ -2224,6 +2310,8 @@ async def join_menu_view(chat_id: int):
     )
     kb.button(text="✏️ Изменить приветствие", callback_data=f"jg:{chat_id}")
     kb.button(text="👁 Показать приветствие", callback_data=f"jv:{chat_id}")
+    kb.button(text=f"⏰ Напоминание: {remind_btn}", callback_data=f"jr:{chat_id}")
+    kb.button(text="✏️ Текст напоминания", callback_data=f"jq:{chat_id}")
     kb.button(text="📋 Заявки", callback_data=f"jl:{chat_id}")
     kb.button(text="⬅️ Назад", callback_data=f"chat:{chat_id}")
     kb.adjust(1)
@@ -2561,6 +2649,87 @@ async def cb_jy(call: CallbackQuery):
 @dp.callback_query(F.data.startswith("jx:"))
 async def cb_jx(call: CallbackQuery):
     await decide_application(call, approve=False)
+
+
+@dp.callback_query(F.data.startswith("jr:"))
+async def cb_jr(call: CallbackQuery):
+    chat_id, *rest = ids_from(call)
+    if not await check_callback_admin(call, chat_id):
+        return
+    if rest and rest[0] in REMIND_PRESETS:
+        set_setting(chat_id, "join_remind_min", rest[0])
+
+    current = get_settings(chat_id)["join_remind_min"]
+    kb = InlineKeyboardBuilder()
+    for minutes in REMIND_PRESETS:
+        mark = "✅ " if minutes == current else ""
+        kb.button(
+            text=f"{mark}{fmt_minutes(minutes, 'Выключено')}",
+            callback_data=f"jr:{chat_id}:{minutes}",
+        )
+    kb.button(text="⬅️ Назад", callback_data=f"jn:{chat_id}")
+    kb.adjust(2, 2, 2, 1, 1)
+    await safe_edit(
+        call,
+        "Через сколько напомнить заявителю, если он ничего не прислал?\n"
+        "Напоминание приходит один раз. Максимум 23 часа: позже Telegram не даёт "
+        "боту писать тому, кто не отвечал.\n\n"
+        f"Сейчас: {fmt_minutes(current, 'выключено')}\n"
+        "Новое значение действует для заявок, поданных после изменения.",
+        kb.as_markup(),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("jq:"))
+async def cb_jq(call: CallbackQuery, state: FSMContext):
+    (chat_id,) = ids_from(call)
+    if not await check_callback_admin(call, chat_id):
+        return
+    await state.set_state(EditReminder.text)
+    await state.update_data(chat_id=chat_id)
+    await safe_edit(
+        call,
+        "Пришли новый текст напоминания. Оформление Telegram сохранится, "
+        "либо можно писать HTML-теги.\n"
+        "{name} заменится на имя заявителя, {chat} на название группы.\n\n"
+        "Отмена: кнопка «Назад» или /cancel",
+        back_button(f"jn:{chat_id}"),
+    )
+    await call.answer()
+
+
+@dp.message(EditReminder.text, F.text, F.chat.type == "private")
+async def got_reminder(message: Message, state: FSMContext):
+    chat_id = (await state.get_data())["chat_id"]
+    if not await user_is_admin(chat_id, message.from_user.id):
+        await state.clear()
+        await message.answer("Нет прав в этой группе.")
+        return
+
+    has_format = any(e.type in FORMAT_TYPES for e in (message.entities or []))
+    reminder = message.html_text if has_format else message.text
+    if len(reminder) > 3000:
+        await message.answer("Слишком длинно, сократи до 3000 символов.")
+        return
+
+    preview = render_greeting(reminder, message.from_user.first_name, get_title(chat_id))
+    try:
+        _, html_failed = await send_payload(message.chat.id, preview, None)
+    except Exception as e:
+        logging.error("напоминание: %s", e)
+        await message.answer("Не получилось отправить такой текст, возможно, он слишком длинный.")
+        return
+    if html_failed:
+        await message.answer("HTML распознать не удалось. Проверь теги и пришли текст ещё раз.")
+        return
+
+    set_setting(chat_id, "join_reminder", reminder)
+    await state.clear()
+    await message.answer(
+        "✅ Сохранено. Выше показано, как напоминание увидит заявитель.",
+        reply_markup=back_button(f"jn:{chat_id}"),
+    )
 
 
 # ---------- ответы заявителей в личке (держать в конце, после всех личных обработчиков) ----------
